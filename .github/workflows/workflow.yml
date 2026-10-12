@@ -1,0 +1,276 @@
+name: CI Worker Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: 'Worker ID'
+        required: true
+        default: 'generic-worker'
+      restore_source:
+        description: 'repo | artifact | release | all | none'
+        required: true
+        default: 'all'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  processor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ============================================================
+      # 1. TAILSCALE
+      # ============================================================
+      - name: Initialize Network
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: ${{ github.event.inputs.worker_id }}
+          tags: tag:ci
+          args: --ssh
+
+      # ============================================================
+      # 2. RESTORE
+      # ============================================================
+      - name: Fetch Environment State
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          RESTORE_SOURCE: ${{ github.event.inputs.restore_source }}
+        run: |
+          set -euo pipefail
+          mkdir -p /home/runner/work
+          cd /home/runner/work
+
+          CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
+
+          decrypt_blob() {
+            local in="$1" out="$2"
+            for iter in 100000 10000 1000 1; do
+              if openssl enc -aes-256-cbc -d -pbkdf2 -iter "$iter" \
+                   -pass pass:"$ENC_PASS" -in "$in" -out "$out" 2>/dev/null; then
+                echo "Decrypted with iter=$iter"
+                return 0
+              fi
+            done
+            echo "All decryption attempts failed for $in"
+            return 1
+          }
+
+          if [[ "$RESTORE_SOURCE" == "none" ]]; then
+            echo "Skipping restore (source=none)."
+            exit 0
+          fi
+
+          # --- A. Private repo chunks ---
+          if [[ "$RESTORE_SOURCE" == "repo" || "$RESTORE_SOURCE" == "all" ]]; then
+            if git clone "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" state-repo 2>/dev/null; then
+              if ls state-repo/chunks/state_part_* 1>/dev/null 2>&1; then
+                cat state-repo/chunks/state_part_* > /tmp/repo.tar.gz.enc
+                if decrypt_blob /tmp/repo.tar.gz.enc /tmp/repo.tar.gz; then
+                  sudo tar -xzf /tmp/repo.tar.gz -C / --no-same-owner --overwrite
+                  echo "Restored from REPO"
+                fi
+              fi
+            fi
+          fi
+
+          # --- B. Artifact (whole encrypted blob) ---
+          if [[ "$RESTORE_SOURCE" == "artifact" || "$RESTORE_SOURCE" == "all" ]]; then
+            ART_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-backup" \
+              --jq '.artifacts | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+            if [[ -n "$ART_ID" && "$ART_ID" != "null" ]]; then
+              gh api "repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip" > /tmp/artifact.zip
+              rm -rf /tmp/artifact && unzip -o /tmp/artifact.zip -d /tmp/artifact
+              if decrypt_blob /tmp/artifact/state.tar.gz.enc /tmp/artifact.tar.gz; then
+                sudo tar -xzf /tmp/artifact.tar.gz -C / --no-same-owner --overwrite
+                echo "Restored from ARTIFACT"
+              fi
+            fi
+          fi
+
+          # --- C. Release (whole encrypted blob) ---
+          if [[ "$RESTORE_SOURCE" == "release" || "$RESTORE_SOURCE" == "all" ]]; then
+            rm -rf /tmp/release && mkdir -p /tmp/release
+            if gh release download --repo "${{ github.repository }}" \
+                 --pattern 'state.tar.gz.enc' --dir /tmp/release 2>/dev/null; then
+              if decrypt_blob /tmp/release/state.tar.gz.enc /tmp/release.tar.gz; then
+                sudo tar -xzf /tmp/release.tar.gz -C / --no-same-owner --overwrite
+                echo "Restored from RELEASE"
+              fi
+            fi
+          fi
+
+      # ============================================================
+      # 3. PAYLOAD
+      # ============================================================
+      - name: Process Workload
+        run: |
+          set -euo pipefail
+          TARGET_USER="${{ github.event.inputs.worker_id }}"
+
+          if ! id "$TARGET_USER" &>/dev/null; then
+            sudo useradd -m -s /bin/bash "$TARGET_USER"
+            sudo usermod -aG sudo "$TARGET_USER"
+          fi
+
+          echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
+
+          if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
+            sudo -u "$TARGET_USER" bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
+          fi
+
+          # Wait for /tmp/stop_worker instead of hard sleep
+          for i in $(seq 1 2070); do
+            [ -f /tmp/stop_worker ] && break
+            sleep 10
+          done
+
+      # ============================================================
+      # 4. FINALIZE
+      # ============================================================
+      - name: Finalize Environment State
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+        run: |
+          set -euo pipefail
+          echo "Finalizing state..."
+
+          if id "$TARGET_USER" &>/dev/null; then
+            sudo pkill -SIGINT -u "$TARGET_USER" || true
+            sleep 10
+          else
+            echo "User $TARGET_USER missing, skipping pkill."
+          fi
+
+          cd /home/runner/work
+          CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
+
+          # Compress + encrypt
+          sudo tar -czPf - \
+            --exclude=/home/runner/work/state-repo \
+            --exclude=/home/runner/work/_actions \
+            --exclude='*/.git' \
+            /home/runner/work /home/"$TARGET_USER" 2>/dev/null \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
+                -pass pass:"$ENC_PASS" -out /tmp/state.tar.gz.enc
+
+          sha256sum /tmp/state.tar.gz.enc | awk '{print $1}' > /tmp/state.sha256
+          echo "LOCAL HASH: $(cat /tmp/state.sha256)"
+
+          # Split into 50 MB chunks
+          mkdir -p state-repo/chunks
+          rm -f state-repo/chunks/state_part_*
+          split -b 50M /tmp/state.tar.gz.enc state-repo/chunks/state_part_
+
+          # --- A. Push to private backup repo ---
+          cd state-repo
+          if [ ! -d ".git" ]; then
+            git init
+            git branch -m main
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan temp-branch 2>/dev/null || git checkout temp-branch
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/state.sha256 ./state.sha256
+          git add chunks/ state.sha256
+          git commit -m "Automated State Finalization [skip ci]" || echo "nothing to commit"
+          git branch -M main
+          git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
+
+          # --- B. Prep artifact ---
+          mkdir -p /tmp/artifact-out
+          cp /tmp/state.tar.gz.enc /tmp/artifact-out/
+          cp /tmp/state.sha256      /tmp/artifact-out/
+
+          # --- C. Create release ---
+          TAG="state-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Encrypted State $TAG" \
+            --notes "sha256: $(cat /tmp/state.sha256)" \
+            /tmp/state.tar.gz.enc /tmp/state.sha256 || true
+
+      # ============================================================
+      # 5. UPLOAD ARTIFACT
+      # ============================================================
+      - name: Upload Encrypted Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-backup
+          path: |
+            /tmp/artifact-out/state.tar.gz.enc
+            /tmp/artifact-out/state.sha256
+          retention-days: 30
+
+      # ============================================================
+      # 6. COMPARE HASHES
+      # ============================================================
+      - name: Compare Hashes Across Sources
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+        run: |
+          set -euo pipefail
+          cd /home/runner/work
+
+          if [ ! -f /tmp/state.sha256 ]; then
+            echo "❌ /tmp/state.sha256 missing — finalize step failed."
+            exit 1
+          fi
+
+          LOCAL_HASH=$(cat /tmp/state.sha256)
+
+          # Repo
+          if ls state-repo/chunks/state_part_* 1>/dev/null 2>&1; then
+            cat state-repo/chunks/state_part_* > /tmp/from_repo.enc
+            REPO_HASH=$(sha256sum /tmp/from_repo.enc | awk '{print $1}')
+          else
+            REPO_HASH="MISSING"
+          fi
+
+          # Artifact
+          ART_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-backup" \
+            --jq '.artifacts | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+          if [[ -n "$ART_ID" && "$ART_ID" != "null" ]]; then
+            gh api "repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip" > /tmp/art.zip
+            rm -rf /tmp/art && unzip -o /tmp/art.zip -d /tmp/art >/dev/null
+            ART_HASH=$(sha256sum /tmp/art/state.tar.gz.enc | awk '{print $1}')
+          else
+            ART_HASH="MISSING"
+          fi
+
+          # Release
+          rm -rf /tmp/rel && mkdir -p /tmp/rel
+          if gh release download --repo "${{ github.repository }}" \
+               --pattern 'state.tar.gz.enc' --dir /tmp/rel 2>/dev/null; then
+            REL_HASH=$(sha256sum /tmp/rel/state.tar.gz.enc | awk '{print $1}')
+          else
+            REL_HASH="MISSING"
+          fi
+
+          echo "LOCAL : $LOCAL_HASH"
+          echo "REPO  : $REPO_HASH"
+          echo "ART   : $ART_HASH"
+          echo "REL   : $REL_HASH"
+
+          if [[ "$LOCAL_HASH" == "$REPO_HASH" && "$LOCAL_HASH" == "$ART_HASH" && "$LOCAL_HASH" == "$REL_HASH" ]]; then
+            echo "✅ All sources match."
+          else
+            echo "❌ MISMATCH."
+            exit 1
+          fi
