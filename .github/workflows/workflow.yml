@@ -19,7 +19,7 @@ permissions:
 jobs:
   processor:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 355
 
     steps:
       # ============================================================
@@ -110,29 +110,35 @@ jobs:
       # ============================================================
       # 3. PAYLOAD
       # ============================================================
+      # Process Workload step
       - name: Process Workload
         run: |
           set -euo pipefail
           TARGET_USER="${{ github.event.inputs.worker_id }}"
-
+      
           if ! id "$TARGET_USER" &>/dev/null; then
             sudo useradd -m -s /bin/bash "$TARGET_USER"
             sudo usermod -aG sudo "$TARGET_USER"
           fi
-
+      
           echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER >/dev/null
           sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
-
+      
           if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
             sudo -u "$TARGET_USER" bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
           fi
-
-          # Wait for /tmp/stop_worker instead of hard sleep
-          for i in $(seq 1 2070); do
-            [ -f /tmp/stop_worker ] && break
+      
+          # Poll every 10s, but exit at 5h 30m (19800s) max to leave 20m headroom
+          # for Finalize (tar + encrypt + chunk + push + release + artifact)
+          MAX_TICKS=$((5 * 60 * 60 / 10))  # 5 hours = 1800 ticks
+          for i in $(seq 1 $MAX_TICKS); do
+            if [ -f /tmp/stop_worker ]; then
+              echo "Stop marker found, releasing at tick $i"
+              break
+            fi
             sleep 10
           done
-
+          echo "Workload loop exited after $i ticks (~$((i*10))s)"
       # ============================================================
       # 4. FINALIZE
       # ============================================================
@@ -146,18 +152,18 @@ jobs:
         run: |
           set -euo pipefail
           echo "Finalizing state..."
-
+      
           if id "$TARGET_USER" &>/dev/null; then
             sudo pkill -SIGINT -u "$TARGET_USER" || true
             sleep 10
           else
             echo "User $TARGET_USER missing, skipping pkill."
           fi
-
+      
           cd /home/runner/work
           CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
           CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
-
+      
           # Compress + encrypt
           sudo tar -czPf - \
             --exclude=/home/runner/work/state-repo \
@@ -166,16 +172,21 @@ jobs:
             /home/runner/work /home/"$TARGET_USER" 2>/dev/null \
             | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
                 -pass pass:"$ENC_PASS" -out /tmp/state.tar.gz.enc
-
+      
           sha256sum /tmp/state.tar.gz.enc | awk '{print $1}' > /tmp/state.sha256
           echo "LOCAL HASH: $(cat /tmp/state.sha256)"
-
-          # Split into 50 MB chunks
+      
+          # Prep artifact FIRST (so it can upload even if push fails)
+          mkdir -p /tmp/artifact-out
+          cp /tmp/state.tar.gz.enc /tmp/artifact-out/
+          cp /tmp/state.sha256      /tmp/artifact-out/
+      
+          # Split into chunks
           mkdir -p state-repo/chunks
           rm -f state-repo/chunks/state_part_*
           split -b 50M /tmp/state.tar.gz.enc state-repo/chunks/state_part_
-
-          # --- A. Push to private backup repo ---
+      
+          # Push chunks to private repo
           cd state-repo
           if [ ! -d ".git" ]; then
             git init
@@ -190,13 +201,8 @@ jobs:
           git commit -m "Automated State Finalization [skip ci]" || echo "nothing to commit"
           git branch -M main
           git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
-
-          # --- B. Prep artifact ---
-          mkdir -p /tmp/artifact-out
-          cp /tmp/state.tar.gz.enc /tmp/artifact-out/
-          cp /tmp/state.sha256      /tmp/artifact-out/
-
-          # --- C. Create release ---
+      
+          # Create release
           TAG="state-$(date +%Y%m%d-%H%M%S)"
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
