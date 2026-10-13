@@ -42,6 +42,7 @@ jobs:
           REPO_NAME: ${{ secrets.BACKUP_REPO }}
           ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
           RESTORE_SOURCE: ${{ github.event.inputs.restore_source }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
         run: |
           set -euo pipefail
           mkdir -p /home/runner/work
@@ -107,38 +108,59 @@ jobs:
             fi
           fi
 
+          # --- D. Post-restore cleanup ---
+          # tar --no-same-owner leaves files owned by root. Fix the target user's home.
+          if id "$TARGET_USER" &>/dev/null; then
+            sudo mkdir -p "/home/$TARGET_USER"
+            sudo chown -R "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER" 2>/dev/null || true
+            echo "Fixed ownership of /home/$TARGET_USER"
+          fi
+
       # ============================================================
       # 3. PAYLOAD
       # ============================================================
-      # Process Workload step
       - name: Process Workload
         run: |
           set -euo pipefail
           TARGET_USER="${{ github.event.inputs.worker_id }}"
-      
+
+          # Create user if missing
           if ! id "$TARGET_USER" &>/dev/null; then
             sudo useradd -m -s /bin/bash "$TARGET_USER"
             sudo usermod -aG sudo "$TARGET_USER"
           fi
-      
+
+          # Guarantee home dir exists (restore may have missed it)
+          sudo mkdir -p "/home/$TARGET_USER"
+          sudo chown -R "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER"
+          sudo chmod 755 "/home/$TARGET_USER"
+
+          # Passwordless sudo
           echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER >/dev/null
           sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
-      
+
+          # Launch workload and remember its PID
           if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
+            echo "Launching .cloud_init..."
             sudo -u "$TARGET_USER" bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
+            WORKLOAD_PID=$!
+            echo "$WORKLOAD_PID" | sudo tee "/home/$TARGET_USER/.cloud_init.pid" >/dev/null
+            echo "Workload PID: $WORKLOAD_PID"
+          else
+            echo "No .cloud_init found, running idle."
           fi
-      
-          # Poll every 10s, but exit at 5h 30m (19800s) max to leave 20m headroom
-          # for Finalize (tar + encrypt + chunk + push + release + artifact)
-          MAX_TICKS=$((5 * 60 * 60 / 10))  # 5 hours = 1800 ticks
+
+          # Poll every 10s, exit at 5h max to leave headroom for Finalize
+          MAX_TICKS=$((5 * 60 * 60 / 10))   # 5 hours = 1800 ticks
           for i in $(seq 1 $MAX_TICKS); do
             if [ -f /tmp/stop_worker ]; then
-              echo "Stop marker found, releasing at tick $i"
+              echo "Stop marker found at tick $i"
               break
             fi
             sleep 10
           done
           echo "Workload loop exited after $i ticks (~$((i*10))s)"
+
       # ============================================================
       # 4. FINALIZE
       # ============================================================
@@ -152,41 +174,59 @@ jobs:
         run: |
           set -euo pipefail
           echo "Finalizing state..."
-      
-          if id "$TARGET_USER" &>/dev/null; then
-            sudo pkill -SIGINT -u "$TARGET_USER" || true
-            sleep 10
+
+          # Targeted SIGINT to the workload process only — never pkill -u
+          if [ -f "/home/$TARGET_USER/.cloud_init.pid" ]; then
+            WORKLOAD_PID=$(sudo cat "/home/$TARGET_USER/.cloud_init.pid" 2>/dev/null || echo "")
+            if [ -n "$WORKLOAD_PID" ] && kill -0 "$WORKLOAD_PID" 2>/dev/null; then
+              echo "Sending SIGINT to workload PID $WORKLOAD_PID"
+              sudo kill -SIGINT "$WORKLOAD_PID" 2>/dev/null || true
+              sleep 10
+            else
+              echo "Workload PID $WORKLOAD_PID not running."
+            fi
           else
-            echo "User $TARGET_USER missing, skipping pkill."
+            echo "No workload PID file, skipping signal."
           fi
-      
+
           cd /home/runner/work
           CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
           CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
-      
+
+          # Ensure the target user home exists before tarring
+          if [ ! -d "/home/$TARGET_USER" ]; then
+            echo "⚠️  /home/$TARGET_USER missing — creating empty dir for backup"
+            sudo mkdir -p "/home/$TARGET_USER"
+            sudo chown "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER"
+          fi
+
           # Compress + encrypt
           sudo tar -czPf - \
             --exclude=/home/runner/work/state-repo \
             --exclude=/home/runner/work/_actions \
             --exclude='*/.git' \
+            --exclude='/home/'"$TARGET_USER"'/.omniroute/runtime' \
+            --exclude='/home/'"$TARGET_USER"'/.omniroute/tls-client' \
+            --exclude='/home/'"$TARGET_USER"'/.omniroute/logs' \
+            --exclude='/home/'"$TARGET_USER"'/.omniroute/call_logs' \
             /home/runner/work /home/"$TARGET_USER" 2>/dev/null \
             | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
                 -pass pass:"$ENC_PASS" -out /tmp/state.tar.gz.enc
-      
+
           sha256sum /tmp/state.tar.gz.enc | awk '{print $1}' > /tmp/state.sha256
           echo "LOCAL HASH: $(cat /tmp/state.sha256)"
-      
-          # Prep artifact FIRST (so it can upload even if push fails)
+
+          # Prep artifact FIRST (uploads even if the git push fails)
           mkdir -p /tmp/artifact-out
           cp /tmp/state.tar.gz.enc /tmp/artifact-out/
           cp /tmp/state.sha256      /tmp/artifact-out/
-      
-          # Split into chunks
+
+          # Split into 50 MB chunks
           mkdir -p state-repo/chunks
           rm -f state-repo/chunks/state_part_*
           split -b 50M /tmp/state.tar.gz.enc state-repo/chunks/state_part_
-      
-          # Push chunks to private repo
+
+          # Push chunks to private backup repo
           cd state-repo
           if [ ! -d ".git" ]; then
             git init
@@ -201,8 +241,8 @@ jobs:
           git commit -m "Automated State Finalization [skip ci]" || echo "nothing to commit"
           git branch -M main
           git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
-      
-          # Create release
+
+          # Create release (repo from context, not hardcoded)
           TAG="state-$(date +%Y%m%d-%H%M%S)"
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
