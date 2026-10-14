@@ -56,12 +56,27 @@ jobs:
             for iter in 100000 10000 1000 1; do
               if openssl enc -aes-256-cbc -d -pbkdf2 -iter "$iter" \
                    -pass pass:"$ENC_PASS" -in "$in" -out "$out" 2>/dev/null; then
-                echo "Decrypted with iter=$iter"
-                return 0
+                # Validate gzip magic bytes
+                if [ -f "$out" ] && [ "$(head -c 2 "$out" | xxd -p 2>/dev/null)" = "1f8b" ]; then
+                  echo "Decrypted with iter=$iter (valid gzip)"
+                  return 0
+                fi
               fi
             done
-            echo "All decryption attempts failed for $in"
+            echo "All decryption attempts failed or produced invalid gzip for $in"
             return 1
+          }
+
+          validate_and_extract() {
+            local tarball="$1" label="$2"
+            if tar -tzf "$tarball" >/dev/null 2>&1; then
+              sudo tar -xzf "$tarball" -C / --no-same-owner --overwrite
+              echo "Restored from $label"
+              return 0
+            else
+              echo "⚠️  $label archive is corrupt, skipping"
+              return 1
+            fi
           }
 
           if [[ "$RESTORE_SOURCE" == "none" ]]; then
@@ -75,35 +90,32 @@ jobs:
               if ls state-repo/chunks/state_part_* 1>/dev/null 2>&1; then
                 cat state-repo/chunks/state_part_* > /tmp/repo.tar.gz.enc
                 if decrypt_blob /tmp/repo.tar.gz.enc /tmp/repo.tar.gz; then
-                  sudo tar -xzf /tmp/repo.tar.gz -C / --no-same-owner --overwrite
-                  echo "Restored from REPO"
+                  validate_and_extract /tmp/repo.tar.gz "REPO" || true
                 fi
               fi
             fi
           fi
 
-          # --- B. Artifact (whole encrypted blob) ---
+          # --- B. Artifact ---
           if [[ "$RESTORE_SOURCE" == "artifact" || "$RESTORE_SOURCE" == "all" ]]; then
             ART_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-backup" \
               --jq '.artifacts | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
             if [[ -n "$ART_ID" && "$ART_ID" != "null" ]]; then
               gh api "repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip" > /tmp/artifact.zip
-              rm -rf /tmp/artifact && unzip -o /tmp/artifact.zip -d /tmp/artifact
+              rm -rf /tmp/artifact && unzip -o /tmp/artifact.zip -d /tmp/artifact >/dev/null
               if decrypt_blob /tmp/artifact/state.tar.gz.enc /tmp/artifact.tar.gz; then
-                sudo tar -xzf /tmp/artifact.tar.gz -C / --no-same-owner --overwrite
-                echo "Restored from ARTIFACT"
+                validate_and_extract /tmp/artifact.tar.gz "ARTIFACT" || true
               fi
             fi
           fi
 
-          # --- C. Release (whole encrypted blob) ---
+          # --- C. Release ---
           if [[ "$RESTORE_SOURCE" == "release" || "$RESTORE_SOURCE" == "all" ]]; then
             rm -rf /tmp/release && mkdir -p /tmp/release
             if gh release download --repo "${{ github.repository }}" \
                  --pattern 'state.tar.gz.enc' --dir /tmp/release 2>/dev/null; then
               if decrypt_blob /tmp/release/state.tar.gz.enc /tmp/release.tar.gz; then
-                sudo tar -xzf /tmp/release.tar.gz -C / --no-same-owner --overwrite
-                echo "Restored from RELEASE"
+                validate_and_extract /tmp/release.tar.gz "RELEASE" || true
               fi
             fi
           fi
@@ -123,22 +135,18 @@ jobs:
           set -euo pipefail
           TARGET_USER="${{ github.event.inputs.worker_id }}"
 
-          # Create user if missing
           if ! id "$TARGET_USER" &>/dev/null; then
             sudo useradd -m -s /bin/bash "$TARGET_USER"
             sudo usermod -aG sudo "$TARGET_USER"
           fi
 
-          # Guarantee home dir
           sudo mkdir -p "/home/$TARGET_USER"
           sudo chown -R "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER"
           sudo chmod 755 "/home/$TARGET_USER"
 
-          # Passwordless sudo
           echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER >/dev/null
           sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
 
-          # Launch workload
           if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
             echo "Launching .cloud_init..."
             sudo -u "$TARGET_USER" bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
@@ -149,7 +157,6 @@ jobs:
             echo "No .cloud_init found, running idle."
           fi
 
-          # 5h 20m loop, exits early on /tmp/stop_worker
           MAX_TICKS=$(( (5 * 60 + 20) * 60 / 10 ))
           for i in $(seq 1 $MAX_TICKS); do
             if [ -f /tmp/stop_worker ]; then
@@ -174,10 +181,9 @@ jobs:
           set -euo pipefail
           echo "Finalizing state..."
 
-          # ---- Ensure working dir exists BEFORE cd ----
           mkdir -p /home/runner/work
 
-          # ---- Signal workload (targeted) ----
+          # ---- Signal workload ----
           if [ -f "/home/$TARGET_USER/.cloud_init.pid" ]; then
             WORKLOAD_PID=$(sudo cat "/home/$TARGET_USER/.cloud_init.pid" 2>/dev/null || echo "")
             if [ -n "$WORKLOAD_PID" ] && kill -0 "$WORKLOAD_PID" 2>/dev/null; then
@@ -195,7 +201,6 @@ jobs:
           CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
           CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
 
-          # ---- Ensure target home exists ----
           if [ ! -d "/home/$TARGET_USER" ]; then
             echo "⚠️  /home/$TARGET_USER missing — creating empty dir"
             sudo mkdir -p "/home/$TARGET_USER"
@@ -212,7 +217,7 @@ jobs:
             fi
           done
 
-          # ---- Compress + encrypt (tar exit 1 is acceptable) ----
+          # ---- Compress + encrypt ----
           set +e
           sudo tar -czPf - \
             --warning=no-file-changed \
@@ -237,7 +242,6 @@ jobs:
             exit 1
           fi
 
-          # ---- Verify tar output ----
           if [ ! -s /tmp/state.tar.gz.enc ]; then
             echo "❌ /tmp/state.tar.gz.enc empty or missing"
             exit 1
@@ -248,55 +252,73 @@ jobs:
           echo "LOCAL HASH: $LOCAL_HASH"
           echo "Encrypted size: $(du -h /tmp/state.tar.gz.enc | cut -f1)"
 
-          # ---- Post-tar content check ----
+          # ---- Post-tar content check (single pass) ----
           echo "=== Post-tar content check ==="
-          HERMES_COUNT=$(sudo tar -tzf /tmp/state.tar.gz 2>/dev/null | grep -c '\.hermes' || true)
-          OMNI_COUNT=$(sudo tar -tzf /tmp/state.tar.gz 2>/dev/null | grep -c '\.omniroute' || true)
-          TOTAL_COUNT=$(sudo tar -tzf /tmp/state.tar.gz 2>/dev/null | wc -l || echo 0)
+          sudo tar -tzf /tmp/state.tar.gz > /tmp/tar-list.txt 2>/dev/null || true
+          HERMES_COUNT=$(grep -c '\.hermes' /tmp/tar-list.txt || true)
+          OMNI_COUNT=$(grep -c '\.omniroute' /tmp/tar-list.txt || true)
+          TOTAL_COUNT=$(wc -l < /tmp/tar-list.txt || echo 0)
           echo "hermes files:    $HERMES_COUNT"
           echo "omniroute files: $OMNI_COUNT"
           echo "total entries:   $TOTAL_COUNT"
 
-          # ---- Prep artifact dir FIRST ----
+          # ---- Prep artifact dir ----
           mkdir -p /tmp/artifact-out
           cp /tmp/state.tar.gz.enc /tmp/artifact-out/
           cp /tmp/state.sha256      /tmp/artifact-out/
           ls -la /tmp/artifact-out/
 
-          # ---- Split into 50 MB chunks ----
-          mkdir -p state-repo/chunks
-          rm -f state-repo/chunks/state_part_*
-          split -b 50M /tmp/state.tar.gz.enc state-repo/chunks/state_part_
-
-          # ---- Push chunks to private backup repo ----
-          cd state-repo
-          if [ ! -d ".git" ]; then
+          # ============================================================
+          # Fresh clone of the backup repo — never reuse the restore clone
+          # ============================================================
+          rm -rf /tmp/backup-repo
+          if git clone "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" /tmp/backup-repo 2>/dev/null; then
+            echo "Cloned existing backup repo"
+          else
+            echo "Backup repo empty or clone failed, initializing fresh"
+            mkdir -p /tmp/backup-repo
+            cd /tmp/backup-repo
             git init
-            git branch -m main
+            git remote add origin "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git"
           fi
+
+          cd /tmp/backup-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Orphan branch: start with a clean index, keep the working tree empty
           git checkout --orphan temp-branch 2>/dev/null || git checkout temp-branch
-          git rm -rf . >/dev/null 2>&1 || true
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          git clean -fdx >/dev/null 2>&1 || true
+
+          # ---- Write fresh chunks (after the clean) ----
+          mkdir -p chunks
+          rm -f chunks/state_part_*
+          split -b 50M /tmp/state.tar.gz.enc chunks/state_part_
           cp /tmp/state.sha256 ./state.sha256
-          git add chunks/ state.sha256
+
+          git add -A
           git commit -m "Automated State Finalization [skip ci]" || echo "nothing to commit"
           git branch -M main
-          git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
+          git push -f origin main
 
-          # ---- Create release ----
+          # ============================================================
+          # Create release
+          # ============================================================
           TAG="state-$(date +%Y%m%d-%H%M%S)"
           echo "Creating release: $TAG"
-          gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
-            --title "Encrypted State $TAG" \
-            --notes "sha256: $LOCAL_HASH" \
-            /tmp/state.tar.gz.enc /tmp/state.sha256 \
-            && echo "✅ Release $TAG created" \
-            || echo "⚠️  Release creation failed (continuing)"
+          if gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "Encrypted State $TAG" \
+              --notes "sha256: $LOCAL_HASH" \
+              /tmp/state.tar.gz.enc /tmp/state.sha256; then
+            echo "✅ Release $TAG created"
+          else
+            echo "⚠️  Release creation failed (continuing)"
+          fi
 
       # ============================================================
-      # 5. UPLOAD ARTIFACT — always, even if Finalize failed
+      # 5. UPLOAD ARTIFACT
       # ============================================================
       - name: Upload Encrypted Artifact
         if: always()
@@ -328,9 +350,9 @@ jobs:
 
           LOCAL_HASH=$(cat /tmp/state.sha256)
 
-          # Repo
-          if ls state-repo/chunks/state_part_* 1>/dev/null 2>&1; then
-            cat state-repo/chunks/state_part_* > /tmp/from_repo.enc
+          # Repo — read from the fresh clone pushed in Finalize
+          if ls /tmp/backup-repo/chunks/state_part_* 1>/dev/null 2>&1; then
+            cat /tmp/backup-repo/chunks/state_part_* > /tmp/from_repo.enc
             REPO_HASH=$(sha256sum /tmp/from_repo.enc | awk '{print $1}')
           else
             REPO_HASH="MISSING"
