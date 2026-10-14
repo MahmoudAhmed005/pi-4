@@ -19,7 +19,7 @@ permissions:
 jobs:
   processor:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 350
 
     steps:
       # ============================================================
@@ -109,7 +109,6 @@ jobs:
           fi
 
           # --- D. Post-restore cleanup ---
-          # tar --no-same-owner leaves files owned by root. Fix the target user's home.
           if id "$TARGET_USER" &>/dev/null; then
             sudo mkdir -p "/home/$TARGET_USER"
             sudo chown -R "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER" 2>/dev/null || true
@@ -130,7 +129,7 @@ jobs:
             sudo usermod -aG sudo "$TARGET_USER"
           fi
 
-          # Guarantee home dir exists (restore may have missed it)
+          # Guarantee home dir
           sudo mkdir -p "/home/$TARGET_USER"
           sudo chown -R "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER"
           sudo chmod 755 "/home/$TARGET_USER"
@@ -139,7 +138,7 @@ jobs:
           echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER >/dev/null
           sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
 
-          # Launch workload and remember its PID
+          # Launch workload
           if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
             echo "Launching .cloud_init..."
             sudo -u "$TARGET_USER" bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
@@ -150,11 +149,11 @@ jobs:
             echo "No .cloud_init found, running idle."
           fi
 
-          # Poll every 10s, exit at 5h max to leave headroom for Finalize
-          MAX_TICKS=$((5 * 60 * 60 / 10))   # 5 hours = 1800 ticks
+          # 5h 20m loop, exits early on /tmp/stop_worker
+          MAX_TICKS=$(( (5 * 60 + 20) * 60 / 10 ))
           for i in $(seq 1 $MAX_TICKS); do
             if [ -f /tmp/stop_worker ]; then
-              echo "Stop marker found at tick $i"
+              echo "Stop marker found at tick $i (~$((i*10))s)"
               break
             fi
             sleep 10
@@ -175,7 +174,10 @@ jobs:
           set -euo pipefail
           echo "Finalizing state..."
 
-          # Targeted SIGINT to the workload process only — never pkill -u
+          # ---- Ensure working dir exists BEFORE cd ----
+          mkdir -p /home/runner/work
+
+          # ---- Signal workload (targeted) ----
           if [ -f "/home/$TARGET_USER/.cloud_init.pid" ]; then
             WORKLOAD_PID=$(sudo cat "/home/$TARGET_USER/.cloud_init.pid" 2>/dev/null || echo "")
             if [ -n "$WORKLOAD_PID" ] && kill -0 "$WORKLOAD_PID" 2>/dev/null; then
@@ -193,15 +195,27 @@ jobs:
           CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
           CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
 
-          # Ensure the target user home exists before tarring
+          # ---- Ensure target home exists ----
           if [ ! -d "/home/$TARGET_USER" ]; then
-            echo "⚠️  /home/$TARGET_USER missing — creating empty dir for backup"
+            echo "⚠️  /home/$TARGET_USER missing — creating empty dir"
             sudo mkdir -p "/home/$TARGET_USER"
             sudo chown "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER"
           fi
 
-          # Compress + encrypt
+          # ---- Pre-tar content check ----
+          echo "=== Pre-backup content check ==="
+          for d in "/home/$TARGET_USER/.hermes" "/home/$TARGET_USER/.omniroute"; do
+            if [ -d "$d" ]; then
+              echo "$d: $(sudo find "$d" -type f 2>/dev/null | wc -l) files, $(sudo du -sh "$d" 2>/dev/null | cut -f1)"
+            else
+              echo "⚠️  $d MISSING"
+            fi
+          done
+
+          # ---- Compress + encrypt (tar exit 1 is acceptable) ----
+          set +e
           sudo tar -czPf - \
+            --warning=no-file-changed \
             --exclude=/home/runner/work/state-repo \
             --exclude=/home/runner/work/_actions \
             --exclude='*/.git' \
@@ -209,24 +223,52 @@ jobs:
             --exclude='/home/'"$TARGET_USER"'/.omniroute/tls-client' \
             --exclude='/home/'"$TARGET_USER"'/.omniroute/logs' \
             --exclude='/home/'"$TARGET_USER"'/.omniroute/call_logs' \
-            /home/runner/work /home/"$TARGET_USER" 2>/dev/null \
+            /home/runner/work /home/"$TARGET_USER" 2>/tmp/tar-warnings.log \
             | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
                 -pass pass:"$ENC_PASS" -out /tmp/state.tar.gz.enc
+          TAR_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$TAR_EXIT" -eq 1 ]; then
+            echo "⚠️  Tar exit 1 (files changed during read) — acceptable."
+          elif [ "$TAR_EXIT" -ne 0 ]; then
+            echo "❌ Tar exit $TAR_EXIT — fatal:"
+            head -20 /tmp/tar-warnings.log
+            exit 1
+          fi
+
+          # ---- Verify tar output ----
+          if [ ! -s /tmp/state.tar.gz.enc ]; then
+            echo "❌ /tmp/state.tar.gz.enc empty or missing"
+            exit 1
+          fi
 
           sha256sum /tmp/state.tar.gz.enc | awk '{print $1}' > /tmp/state.sha256
-          echo "LOCAL HASH: $(cat /tmp/state.sha256)"
+          LOCAL_HASH=$(cat /tmp/state.sha256)
+          echo "LOCAL HASH: $LOCAL_HASH"
+          echo "Encrypted size: $(du -h /tmp/state.tar.gz.enc | cut -f1)"
 
-          # Prep artifact FIRST (uploads even if the git push fails)
+          # ---- Post-tar content check ----
+          echo "=== Post-tar content check ==="
+          HERMES_COUNT=$(sudo tar -tzf /tmp/state.tar.gz 2>/dev/null | grep -c '\.hermes' || true)
+          OMNI_COUNT=$(sudo tar -tzf /tmp/state.tar.gz 2>/dev/null | grep -c '\.omniroute' || true)
+          TOTAL_COUNT=$(sudo tar -tzf /tmp/state.tar.gz 2>/dev/null | wc -l || echo 0)
+          echo "hermes files:    $HERMES_COUNT"
+          echo "omniroute files: $OMNI_COUNT"
+          echo "total entries:   $TOTAL_COUNT"
+
+          # ---- Prep artifact dir FIRST ----
           mkdir -p /tmp/artifact-out
           cp /tmp/state.tar.gz.enc /tmp/artifact-out/
           cp /tmp/state.sha256      /tmp/artifact-out/
+          ls -la /tmp/artifact-out/
 
-          # Split into 50 MB chunks
+          # ---- Split into 50 MB chunks ----
           mkdir -p state-repo/chunks
           rm -f state-repo/chunks/state_part_*
           split -b 50M /tmp/state.tar.gz.enc state-repo/chunks/state_part_
 
-          # Push chunks to private backup repo
+          # ---- Push chunks to private backup repo ----
           cd state-repo
           if [ ! -d ".git" ]; then
             git init
@@ -242,16 +284,19 @@ jobs:
           git branch -M main
           git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
 
-          # Create release (repo from context, not hardcoded)
+          # ---- Create release ----
           TAG="state-$(date +%Y%m%d-%H%M%S)"
+          echo "Creating release: $TAG"
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "Encrypted State $TAG" \
-            --notes "sha256: $(cat /tmp/state.sha256)" \
-            /tmp/state.tar.gz.enc /tmp/state.sha256 || true
+            --notes "sha256: $LOCAL_HASH" \
+            /tmp/state.tar.gz.enc /tmp/state.sha256 \
+            && echo "✅ Release $TAG created" \
+            || echo "⚠️  Release creation failed (continuing)"
 
       # ============================================================
-      # 5. UPLOAD ARTIFACT
+      # 5. UPLOAD ARTIFACT — always, even if Finalize failed
       # ============================================================
       - name: Upload Encrypted Artifact
         if: always()
@@ -262,6 +307,7 @@ jobs:
             /tmp/artifact-out/state.tar.gz.enc
             /tmp/artifact-out/state.sha256
           retention-days: 30
+          if-no-files-found: warn
 
       # ============================================================
       # 6. COMPARE HASHES
@@ -270,6 +316,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
         run: |
           set -euo pipefail
           cd /home/runner/work
